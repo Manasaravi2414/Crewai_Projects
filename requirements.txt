@@ -1,0 +1,6 @@
+fastapi
+uvicorn[standard]
+crewai
+python-dotenv
+pandas
+pydantic
