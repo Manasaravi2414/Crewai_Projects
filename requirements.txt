@@ -4,3 +4,4 @@ crewai
 python-dotenv
 pandas
 pydantic
+crewai[google-genai]
