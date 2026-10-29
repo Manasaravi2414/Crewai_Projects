@@ -1,49 +1,54 @@
 """
-CrewAI Projects API — all 10 assignment projects.
+CrewAI Multi-Agent Backend Service (Projects 1 to 10)
+Exposes endpoints /agent1 to /agent10 via FastAPI.
 
-Run:
-    pip install -r requirements.txt
-    # Create .env with GEMINI_API_KEY=your_key
-    uvicorn app:app --reload
-
-Each endpoint accepts:
-    {"input": "your task or source text"}
-
-Projects 1–4 use CrewAI Crews. Projects 5–10 use CrewAI Flows.
+Contract:
+  POST {"input": "..."} -> {"output": "..."}
 """
 
 from __future__ import annotations
 
-import json
+import io
 import os
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, List, Optional
 
 import pandas as pd
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from crewai import Agent, Crew, LLM, Process, Task
-from crewai.flow.flow import Flow, listen, or_, router, start
-
-
-# ---------------------------------------------------------------------------
-# 1. Application setup and shared request/response models
-# ---------------------------------------------------------------------------
+from crewai.flow.flow import Flow, and_, listen, or_, router, start
 
 load_dotenv()
 
 app = FastAPI(
     title="CrewAI Projects API",
     description="Ten CrewAI projects exposed through /agent1 to /agent10.",
-    version="1.0.0",
+    version="2.0.0",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "outputs"))
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+try:
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+except Exception:
+    pass
 
+
+# ---------------------------------------------------------------------------
+# 1. Shared Schemas & Helpers
+# ---------------------------------------------------------------------------
 
 class AgentRequest(BaseModel):
     input: str = Field(..., min_length=1, description="Prompt or source content")
@@ -53,29 +58,26 @@ class AgentResponse(BaseModel):
     output: str
 
 
+class ScoreResult(BaseModel):
+    score: int = Field(..., ge=0, le=100, description="Numerical score out of 100")
+    rationale: str = Field(..., description="Evaluation notes and justification")
+
+
 class WorkflowState(BaseModel):
-    """Shared state object used by the six Flow projects."""
     user_input: str = ""
     category: str = ""
     analysis: str = ""
     output: str = ""
     approval: str = ""
-    revision_count: int = 0
-    linkedin_output: str = ""
-    twitter_output: str = ""
-    newsletter_output: str = ""
 
 
 def get_llm() -> LLM:
-    """Create the Gemini LLM; fail with a helpful message if the key is absent."""
-    api_key = os.getenv("GEMINI_API_KEY")
+    api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
     if not api_key:
         raise HTTPException(
             status_code=500,
-            detail="GEMINI_API_KEY is missing. Add it to your .env file.",
+            detail="GEMINI_API_KEY or GOOGLE_API_KEY is missing. Add it to your .env file.",
         )
-
-    # Override GEMINI_MODEL in .env if your account uses another supported model.
     model_name = os.getenv("GEMINI_MODEL", "gemini/gemini-3.5-flash-lite")
     return LLM(model=model_name, api_key=api_key, temperature=0.2)
 
@@ -87,7 +89,6 @@ def make_agent(
     backstory: str,
     tools: list | None = None,
 ) -> Agent:
-    """Keep agent definitions consistent across projects."""
     return Agent(
         role=role,
         goal=goal,
@@ -106,7 +107,6 @@ def run_crew(
     inputs: dict[str, Any] | None = None,
     manager_agent: Agent | None = None,
 ) -> str:
-    """Run one Crew and convert its result to a plain string."""
     crew_options: dict[str, Any] = {
         "agents": agents,
         "tasks": tasks,
@@ -120,32 +120,37 @@ def run_crew(
     return str(result)
 
 
-def save_markdown(filename: str, heading: str, content: str) -> str:
-    """Save a readable project artifact and return its text."""
-    safe_name = re.sub(r"[^a-zA-Z0-9_.-]", "_", filename)
-    path = OUTPUT_DIR / safe_name
-    path.write_text(f"# {heading}\n\n{content}\n", encoding="utf-8")
-    return f"{content}\n\nSaved artifact: {path.as_posix()}"
+def ask_agent(agent: Agent, description: str, expected_output: str, inputs: dict[str, Any]) -> str:
+    task = Task(description=description, expected_output=expected_output, agent=agent)
+    crew = Crew(agents=[agent], tasks=[task], process=Process.sequential, verbose=False)
+    return str(crew.kickoff(inputs=inputs))
 
 
 def run_flow(flow_class: type[Flow], user_input: str) -> str:
-    """Instantiate a Flow, seed its state, execute it, and return the result."""
     flow = flow_class()
-    flow.state.user_input = user_input
-    result = flow.kickoff()
-    # Most methods return the final text. State output is a safe fallback.
+    result = flow.kickoff(inputs={"user_input": user_input})
     if result is None or not str(result).strip():
-        result = flow.state.output
+        result = getattr(flow.state, "output", "")
     return str(result)
 
 
+def save_artifact(filename: str, heading: str, content: str) -> str:
+    try:
+        safe_name = re.sub(r"[^a-zA-Z0-9_.-]", "_", filename)
+        path = OUTPUT_DIR / safe_name
+        path.write_text(f"# {heading}\n\n{content}\n", encoding="utf-8")
+    except Exception:
+        pass
+    return content
+
+
 @app.get("/")
-def root() -> dict[str, str]:
+def root() -> dict[str, Any]:
     return {
         "message": "CrewAI Projects API is running.",
+        "routes": [f"/agent{i}" for i in range(1, 11)],
         "docs": "/docs",
         "health": "/health",
-        "projects": "Use POST /agent1 through POST /agent10.",
     }
 
 
@@ -155,337 +160,225 @@ def health() -> dict[str, str]:
 
 
 # ---------------------------------------------------------------------------
-# PROJECT 1 — Blog Post Crew (sequential process)
+# Project 1: Blog Post Crew (Sequential Process)
 # ---------------------------------------------------------------------------
-
 @app.post("/agent1", response_model=AgentResponse)
 def blog_post_crew(request: AgentRequest) -> AgentResponse:
-    """Research a topic and turn the findings into a blog post."""
     try:
         llm = get_llm()
         researcher = make_agent(
-            llm, "Blog Researcher",
-            "Gather accurate, useful points about the requested topic.",
-            "You are careful about separating established facts from assumptions.",
+            llm, "Senior Research Specialist",
+            "Gather verified, relevant facts and an outline for {topic}.",
+            "You separate established facts from speculation, organizing findings clearly.",
         )
         writer = make_agent(
-            llm, "Blog Writer",
-            "Write a clear, engaging, well-structured blog post.",
-            "You write for curious readers and explain unfamiliar terms simply.",
+            llm, "Editorial Content Writer",
+            "Write a structured, engaging Markdown blog post from research.",
+            "You write clear prose for an industry audience, including headings and takeaways.",
         )
-        research_task = Task(
-            description=(
-                "Research the topic below using your knowledge. Provide a concise "
-                "outline, key facts, examples, caveats, and useful subheadings.\n"
-                "Topic: {topic}"
-            ),
-            expected_output="A factual research brief with an outline and key points.",
+        t_research = Task(
+            description="Research the topic: {topic}. Provide key facts, statistics, and subheadings.",
+            expected_output="Detailed research brief with bulleted key points.",
             agent=researcher,
         )
-        writing_task = Task(
-            description=(
-                "Use the research brief to write a polished 700–900 word blog post. "
-                "Include a title, introduction, descriptive headings, examples, and "
-                "a short conclusion. Do not invent citations or claim web research "
-                "was performed if it was not.\nTopic: {topic}"
-            ),
-            expected_output="A complete blog post in Markdown.",
+        t_write = Task(
+            description="Using the research, write a 600-800 word Markdown blog post on: {topic}.",
+            expected_output="Complete Markdown blog post with title, headings, and conclusion.",
             agent=writer,
-            context=[research_task],
+            context=[t_research],
         )
-        output = run_crew(
-            [researcher, writer],
-            [research_task, writing_task],
-            inputs={"topic": request.input},
-        )
-        return AgentResponse(output=save_markdown("blog_post.md", "Blog Post", output))
-    except HTTPException:
-        raise
+        output = run_crew([researcher, writer], [t_research, t_write], inputs={"topic": request.input})
+        return AgentResponse(output=save_artifact("blog_post.md", "Blog Post", output))
     except Exception as exc:
-        print(f"[agent1] {type(exc).__name__}: {exc}")
-        raise HTTPException(status_code=500, detail="Blog Post Crew failed. Check the server terminal.")
+        raise HTTPException(status_code=500, detail=f"Agent 1 error: {exc}")
 
 
 # ---------------------------------------------------------------------------
-# PROJECT 2 — Competitor Analysis Crew (hierarchical process)
+# Project 2: Competitor Analysis Crew (Hierarchical Process)
 # ---------------------------------------------------------------------------
-
 @app.post("/agent2", response_model=AgentResponse)
 def competitor_analysis_crew(request: AgentRequest) -> AgentResponse:
-    """
-    The input should identify a business/industry and ideally competitor URLs.
-    This implementation clearly labels knowledge-based analysis; it does not
-    silently pretend that live websites were fetched.
-    """
     try:
         llm = get_llm()
         analyst = make_agent(
-            llm, "Competitor Research Analyst",
-            "Identify competitor positioning, likely strengths, weaknesses, and gaps.",
-            "You produce structured competitive research and state uncertainty clearly.",
+            llm, "Competitive Intelligence Analyst",
+            "Map competitor positioning, product capabilities, and customer segments.",
+            "You analyze corporate offerings and clearly flag assumptions.",
         )
         pricing = make_agent(
-            llm, "Pricing Analyst",
-            "Compare pricing models and explain their strategic implications.",
-            "You never invent exact current prices; mark unknowns as needing verification.",
+            llm, "SaaS Pricing Specialist",
+            "Compare subscription tiers, usage models, and monetization strategies.",
+            "You compare packaging models objectively, marking unconfirmed data clearly.",
         )
         strategist = make_agent(
-            llm, "Competitive Strategy Consultant",
-            "Synthesize research into practical, prioritized recommendations.",
-            "You turn market observations into actionable business decisions.",
+            llm, "Strategic Advisor",
+            "Synthesize data into a comparative SWOT matrix and recommendations.",
+            "You turn competitor observations into strategic action plans.",
         )
         manager = make_agent(
-            llm, "Research Project Manager",
-            "Coordinate the specialist analyses into one consistent report.",
-            "You resolve overlap, ask for evidence, and produce a coherent final report.",
+            llm, "Research Director",
+            "Delegate and organize the competitive evaluation into a cohesive report.",
+            "You oversee research depth and ensure consistent output formatting.",
         )
 
-        research_task = Task(
-            description=(
-                "Analyze the following business, industry, and competitor details. "
-                "Identify the likely direct and indirect competitors, target users, "
-                "positioning, differentiators, and evidence gaps. Distinguish facts "
-                "in the input from reasonable hypotheses.\nInput: {details}"
-            ),
-            expected_output="Competitor landscape and positioning analysis.",
+        t_research = Task(
+            description="Examine the target business/competitors: {details}. Identify competitors and offerings.",
+            expected_output="Competitor profiles and market positioning notes.",
             agent=analyst,
         )
-        pricing_task = Task(
-            description=(
-                "Create a pricing comparison framework for the competitors named in "
-                "the input. Compare free tiers, subscriptions, usage-based pricing, "
-                "enterprise plans, and value metrics where relevant. If actual prices "
-                "are not supplied, write 'verify current pricing' instead of guessing.\n"
-                "Input: {details}"
-            ),
-            expected_output="Pricing comparison with unknowns explicitly flagged.",
+        t_pricing = Task(
+            description="Compare pricing models and tiers for competitors in: {details}.",
+            expected_output="Comparative pricing breakdown.",
             agent=pricing,
         )
-        strategy_task = Task(
-            description=(
-                "Using the competitor and pricing analyses, create a practical report "
-                "with: executive summary, competitor table, SWOT-style observations, "
-                "market gaps, 3–5 recommendations, risks, and next steps.\nInput: {details}"
-            ),
-            expected_output="A concise, decision-ready competitor analysis report.",
+        t_strategy = Task(
+            description="Build a comparative SWOT table and strategic takeaways for: {details}.",
+            expected_output="Executive report featuring a SWOT table and recommendations in Markdown.",
             agent=strategist,
-            context=[research_task, pricing_task],
+            context=[t_research, t_pricing],
         )
         output = run_crew(
-            [analyst, pricing, strategist],  # Do not include manager here
-            [research_task, pricing_task, strategy_task],
+            [analyst, pricing, strategist],
+            [t_research, t_pricing, t_strategy],
             process=Process.hierarchical,
             inputs={"details": request.input},
             manager_agent=manager,
         )
-        return AgentResponse(
-            output=save_markdown("competitor_analysis.md", "Competitor Analysis", output)
-        )
-    except HTTPException:
-        raise
+        return AgentResponse(output=save_artifact("competitor_analysis.md", "Competitor Analysis", output))
     except Exception as exc:
-        print(f"[agent2] {type(exc).__name__}: {exc}")
-        raise HTTPException(status_code=500, detail="Competitor Analysis Crew failed. Check the server terminal.")
+        raise HTTPException(status_code=500, detail=f"Agent 2 error: {exc}")
 
 
 # ---------------------------------------------------------------------------
-# PROJECT 3 — Meeting Notes Crew (parallel analysis tasks + formatter)
+# Project 3: Meeting Notes Crew (Async Parallel Tasks + Formatter)
 # ---------------------------------------------------------------------------
-
 @app.post("/agent3", response_model=AgentResponse)
 def meeting_notes_crew(request: AgentRequest) -> AgentResponse:
-    """Convert pasted meeting transcript/rough notes into organized meeting notes."""
     try:
         llm = get_llm()
         summarizer = make_agent(
-            llm, "Meeting Summarizer",
-            "Summarize the meeting accurately and concisely.",
-            "You preserve decisions and important context without adding facts.",
+            llm, "Meeting Secretary",
+            "Condense meeting transcripts into concise executive bullet points.",
+            "You capture core discussion points without introducing unmentioned topics.",
         )
         action_finder = make_agent(
-            llm, "Action Item Extractor",
-            "Extract actions, owners, and deadlines from meeting notes.",
-            "You mark missing owners or deadlines as 'Not specified'.",
+            llm, "Action Item Coordinator",
+            "Extract every action item, responsible owner, and expected deadline.",
+            "You format action items systematically, marking missing owners as 'Unassigned'.",
         )
         decision_finder = make_agent(
-            llm, "Decision Logger",
-            "Identify explicit decisions, unresolved questions, and risks.",
-            "You distinguish a final decision from a suggestion or discussion.",
+            llm, "Governance Recorder",
+            "Document explicit agreements, resolutions, and unresolved blockers.",
+            "You log confirmed agreements and distinguish them from open discussions.",
         )
         formatter = make_agent(
-            llm, "Meeting Notes Formatter",
-            "Combine analyses into clean meeting minutes.",
-            "You produce readable Markdown with consistent headings and tables.",
+            llm, "Documentation Specialist",
+            "Compile extracted details into a clean executive meeting memorandum.",
+            "You organize disparate outputs into a professional Markdown structure.",
         )
 
-        summary_task = Task(
-            description="Summarize this meeting transcript in 5–10 bullets:\n{transcript}",
-            expected_output="Meeting summary bullets.",
+        t1 = Task(
+            description="Summarize this transcript in 5-7 focused bullets:\n{transcript}",
+            expected_output="Executive summary bullet points.",
             agent=summarizer,
             async_execution=True,
         )
-        action_task = Task(
-            description=(
-                "Extract action items from this transcript. Return a table with "
-                "Action, Owner, Deadline, and Status. Use 'Not specified' when absent.\n"
-                "{transcript}"
-            ),
-            expected_output="An action-item table.",
+        t2 = Task(
+            description="Extract all action items as 'Owner | Action | Due Date' from:\n{transcript}",
+            expected_output="Bulleted list or table of actionable assignments.",
             agent=action_finder,
             async_execution=True,
         )
-        decision_task = Task(
-            description=(
-                "List confirmed decisions, open questions, blockers, and risks from "
-                "this transcript. Do not infer a decision that was not made.\n{transcript}"
-            ),
-            expected_output="Decisions and open questions.",
+        t3 = Task(
+            description="List all agreed decisions and open blockers from:\n{transcript}",
+            expected_output="Numbered list of confirmed decisions and risks.",
             agent=decision_finder,
             async_execution=True,
         )
-        format_task = Task(
-            description=(
-                "Combine the preceding analysis into meeting minutes with sections "
-                "Summary, Decisions, Action Items, Open Questions, and Next Meeting. "
-                "Use 'Not specified' if a detail is missing.\nTranscript:\n{transcript}"
-            ),
-            expected_output="Complete meeting minutes in Markdown.",
+        final_task = Task(
+            description="Assemble the summary, action items, and decisions into a finalized minutes document.",
+            expected_output="Clean Markdown minutes with sections: Summary, Decisions, and Action Items.",
             agent=formatter,
-            context=[summary_task, action_task, decision_task],
+            context=[t1, t2, t3],
         )
-        output = run_crew(
-            [summarizer, action_finder, decision_finder, formatter],
-            [summary_task, action_task, decision_task, format_task],
-            inputs={"transcript": request.input},
-        )
-        return AgentResponse(output=save_markdown("meeting_notes.md", "Meeting Notes", output))
-    except HTTPException:
-        raise
+
+        output = run_crew([summarizer, action_finder, decision_finder, formatter], [t1, t2, t3, final_task], inputs={"transcript": request.input})
+        return AgentResponse(output=save_artifact("meeting_notes.md", "Meeting Notes", output))
     except Exception as exc:
-        print(f"[agent3] {type(exc).__name__}: {exc}")
-        raise HTTPException(status_code=500, detail="Meeting Notes Crew failed. Check the server terminal.")
+        raise HTTPException(status_code=500, detail=f"Agent 3 error: {exc}")
 
 
 # ---------------------------------------------------------------------------
-# PROJECT 4 — Data Report Crew (pandas summary + insights and review)
+# Project 4: Data Report Crew (Pandas Pre-Calculation + Review)
 # ---------------------------------------------------------------------------
-
-def summarize_tabular_input(raw_text: str) -> str:
-    """
-    If input contains CSV, calculate basic pandas statistics. For non-CSV input,
-    return a clear note so the LLM can still analyze the supplied description.
-    """
-    lines = [line for line in raw_text.splitlines() if line.strip()]
-    if len(lines) < 2 or not any("," in line for line in lines[:3]):
-        return (
-            "No clearly parseable CSV table was detected. Analyze the supplied "
-            "description qualitatively and state that numerical statistics were unavailable."
-        )
+def compute_data_metrics(raw_text: str) -> str:
+    lines = [l for l in raw_text.splitlines() if l.strip()]
+    if len(lines) < 2 or not any("," in l for l in lines[:3]):
+        return "No valid CSV structure found. Perform a qualitative appraisal of the input."
     try:
-        from io import StringIO
-        frame = pd.read_csv(StringIO(raw_text))
-        if frame.empty:
-            return "The CSV was parsed but contains no data rows."
-        numeric = frame.select_dtypes(include="number")
-        details = [
-            f"Rows: {len(frame)}",
-            f"Columns: {len(frame.columns)}",
-            f"Column names: {', '.join(map(str, frame.columns))}",
-            f"Missing values by column: {frame.isna().sum().to_dict()}",
+        df = pd.read_csv(io.StringIO(raw_text))
+        if df.empty:
+            return "CSV parsed successfully but contains zero data rows."
+        numeric = df.select_dtypes(include="number")
+        stats = [
+            f"Total Rows: {len(df)}",
+            f"Columns: {', '.join(map(str, df.columns))}",
+            f"Missing Values: {df.isna().sum().to_dict()}",
         ]
         if not numeric.empty:
-            details.append("Numeric summary:\n" + numeric.describe().round(3).to_string())
-        else:
-            details.append("No numeric columns were detected.")
-        for column in frame.select_dtypes(exclude="number").columns[:5]:
-            details.append(
-                f"Top values in {column}: {frame[column].value_counts(dropna=False).head(5).to_dict()}"
-            )
-        return "\n\n".join(details)
-    except Exception as exc:
-        return f"CSV parsing was unsuccessful ({type(exc).__name__}). Analyze the input cautiously."
+            stats.append("Descriptive Statistics:\n" + numeric.describe().round(2).to_string())
+        return "\n\n".join(stats)
+    except Exception as e:
+        return f"Unable to parse CSV ({e}). Analyze provided text carefully."
 
 
 @app.post("/agent4", response_model=AgentResponse)
 def data_report_crew(request: AgentRequest) -> AgentResponse:
-    """Accept CSV text or a description of a dataset."""
     try:
         llm = get_llm()
-        stats = summarize_tabular_input(request.input)
+        metrics = compute_data_metrics(request.input)
         analyst = make_agent(
-            llm, "Data Analyst",
-            "Explain dataset patterns and derive evidence-based insights.",
-            "You use the provided statistics and never fabricate numeric results.",
+            llm, "Quantitative Analyst",
+            "Interpret data distributions, key trends, and statistical signals.",
+            "You base conclusions strictly on calculated metrics and avoid hallucinating data.",
         )
         reviewer = make_agent(
-            llm, "Data Report Reviewer",
-            "Check the report for clarity, unsupported claims, and useful caveats.",
-            "You are rigorous about data limitations and distinguish correlation from causation.",
+            llm, "Audit & Quality Reviewer",
+            "Verify analytical claims against data metrics and ensure balanced conclusions.",
+            "You ensure findings distinguish causation from correlation and note data limitations.",
         )
-        analysis_task = Task(
-            description=(
-                "Analyze the dataset input and the pandas summary below. Provide data "
-                "quality observations, trends, notable distributions, possible business "
-                "implications, and limitations. Do not invent statistics.\n"
-                "Original input:\n{dataset}\n\nPandas summary:\n{stats}"
-            ),
-            expected_output="Evidence-based dataset analysis draft.",
+
+        t_analysis = Task(
+            description="Analyze the dataset and computed statistics:\n\nInput:\n{data}\n\nStatistics:\n{stats}",
+            expected_output="Draft data analysis identifying patterns and metrics.",
             agent=analyst,
         )
-        review_task = Task(
-            description=(
-                "Review and improve the analysis. Include Executive Summary, Dataset "
-                "Overview, Key Findings, Data Quality, Recommendations, and Limitations. "
-                "Flag unsupported conclusions.\nDataset:\n{dataset}\n\nStatistics:\n{stats}"
-            ),
-            expected_output="Reviewed data report in Markdown.",
+        t_review = Task(
+            description="Review the analysis. Organize into Executive Summary, Key Trends, Data Quality, and Recommendations.",
+            expected_output="Polished Markdown data report with findings and verified figures.",
             agent=reviewer,
-            context=[analysis_task],
+            context=[t_analysis],
         )
-        # Crew task interpolation uses the kickoff inputs below.
-        crew = Crew(
-            agents=[analyst, reviewer],
-            tasks=[analysis_task, review_task],
-            process=Process.sequential,
-            verbose=False,
-        )
-        output = str(crew.kickoff(inputs={"dataset": request.input, "stats": stats}))
-        return AgentResponse(output=save_markdown("data_report.md", "Data Report", output))
-    except HTTPException:
-        raise
+
+        output = run_crew([analyst, reviewer], [t_analysis, t_review], inputs={"data": request.input, "stats": metrics})
+        return AgentResponse(output=save_artifact("data_report.md", "Data Report", output))
     except Exception as exc:
-        print(f"[agent4] {type(exc).__name__}: {exc}")
-        raise HTTPException(status_code=500, detail="Data Report Crew failed. Check the server terminal.")
+        raise HTTPException(status_code=500, detail=f"Agent 4 error: {exc}")
 
 
 # ---------------------------------------------------------------------------
-# Shared Flow helper
+# Project 5: Customer Support Flow (Classification & Priority Routing)
 # ---------------------------------------------------------------------------
-
-def flow_agent(role: str, goal: str, backstory: str) -> Agent:
-    return make_agent(get_llm(), role, goal, backstory)
-
-
-def ask_agent(agent: Agent, description: str, expected_output: str, inputs: dict[str, Any]) -> str:
-    task = Task(description=description, expected_output=expected_output, agent=agent)
-    crew = Crew(agents=[agent], tasks=[task], process=Process.sequential, verbose=False)
-    return str(crew.kickoff(inputs=inputs))
-
-
-# ---------------------------------------------------------------------------
-# PROJECT 5 — Customer Support Flow (router categories)
-# ---------------------------------------------------------------------------
-
 class CustomerSupportFlow(Flow[WorkflowState]):
     @start()
     def classify_request(self) -> str:
         text = self.state.user_input.lower()
-        if any(word in text for word in ("refund", "payment", "charged", "invoice", "billing", "subscription")):
+        if any(w in text for w in ("refund", "charge", "invoice", "billing", "payment", "subscription")):
             self.state.category = "billing"
-        elif any(word in text for word in ("bug", "error", "crash", "not working", "broken", "technical")):
+        elif any(w in text for w in ("bug", "crash", "error", "broken", "failed", "down", "issue")):
             self.state.category = "technical"
-        elif any(word in text for word in ("cancel", "return", "delivery", "shipping", "order", "account")):
-            self.state.category = "account_or_order"
+        elif any(w in text for w in ("cancel", "password", "login", "order", "shipping", "account")):
+            self.state.category = "account"
         else:
             self.state.category = "general"
         return self.state.category
@@ -496,310 +389,261 @@ class CustomerSupportFlow(Flow[WorkflowState]):
 
     @listen("billing")
     def handle_billing(self) -> str:
-        agent = flow_agent("Billing Support Specialist", "Resolve billing questions helpfully.",
-                           "You explain billing steps and never request passwords or full card details.")
-        return ask_agent(agent, "Draft a helpful billing support reply for this request:\n{message}",
-                         "A clear customer-facing billing reply.", {"message": self.state.user_input})
+        agent = make_agent(get_llm(), "Billing Support Specialist", "Resolve billing inquiries clearly.", "Empathetic and precise.")
+        return ask_agent(agent, "Draft a support reply for this billing inquiry:\n{user_input}", "Polite billing reply.", {"user_input": self.state.user_input})
 
     @listen("technical")
     def handle_technical(self) -> str:
-        agent = flow_agent("Technical Support Specialist", "Troubleshoot technical problems safely.",
-                           "You ask for relevant non-sensitive details and offer ordered troubleshooting steps.")
-        return ask_agent(agent, "Draft a technical support reply with prioritized troubleshooting steps:\n{message}",
-                         "A safe, step-by-step troubleshooting response.", {"message": self.state.user_input})
+        agent = make_agent(get_llm(), "Technical Support Engineer", "Troubleshoot software defects.", "Structured troubleshooter.")
+        return ask_agent(agent, "Draft a step-by-step diagnostic response for:\n{user_input}", "Diagnostic support reply.", {"user_input": self.state.user_input})
 
-    @listen("account_or_order")
-    def handle_account_order(self) -> str:
-        agent = flow_agent("Account and Order Support Specialist", "Help with account and order issues.",
-                           "You give clear next steps and do not claim to access private account systems.")
-        return ask_agent(agent, "Draft a support reply about this account/order issue:\n{message}",
-                         "A helpful account or order support response.", {"message": self.state.user_input})
+    @listen("account")
+    def handle_account(self) -> str:
+        agent = make_agent(get_llm(), "Account Support Representative", "Address account and order access requests.", "Security-conscious agent.")
+        return ask_agent(agent, "Draft a customer support reply for:\n{user_input}", "Account guidance reply.", {"user_input": self.state.user_input})
 
     @listen("general")
     def handle_general(self) -> str:
-        agent = flow_agent("General Customer Support Specialist", "Answer general customer questions.",
-                           "You are polite, concise, and transparent about uncertainty.")
-        return ask_agent(agent, "Draft a helpful general customer support response:\n{message}",
-                         "A concise customer-facing support response.", {"message": self.state.user_input})
+        agent = make_agent(get_llm(), "General Support Representative", "Address general inquiries helpfully.", "Helpful concierge.")
+        return ask_agent(agent, "Draft a helpful customer reply for:\n{user_input}", "Helpful support message.", {"user_input": self.state.user_input})
 
-    @listen(or_(handle_billing, handle_technical, handle_account_order, handle_general))
+    @listen(or_(handle_billing, handle_technical, handle_account, handle_general))
     def finalize(self, response: str) -> str:
-        self.state.output = f"Category: {self.state.category}\n\n{response}"
+        self.state.output = f"**Category**: {self.state.category.upper()}\n\n{response}"
         return self.state.output
 
 
 @app.post("/agent5", response_model=AgentResponse)
-def customer_support_flow(request: AgentRequest) -> AgentResponse:
+def customer_support_endpoint(request: AgentRequest) -> AgentResponse:
     try:
         return AgentResponse(output=run_flow(CustomerSupportFlow, request.input))
-    except HTTPException:
-        raise
     except Exception as exc:
-        print(f"[agent5] {type(exc).__name__}: {exc}")
-        raise HTTPException(status_code=500, detail="Customer Support Flow failed. Check the server terminal.")
+        raise HTTPException(status_code=500, detail=f"Agent 5 error: {exc}")
 
 
 # ---------------------------------------------------------------------------
-# PROJECT 6 — Resume Screening Flow (score and shortlist/reject)
+# Project 6: Resume Screening Flow (Structured Evaluation + Router)
 # ---------------------------------------------------------------------------
-
 class ResumeScreeningFlow(Flow[WorkflowState]):
     @start()
-    def score_resume(self) -> str:
-        agent = flow_agent(
-            "Resume Screening Analyst",
-            "Compare resume evidence against the job criteria and produce a transparent score.",
-            "You evaluate job-related qualifications only, avoid protected characteristics, "
-            "and identify evidence and missing information.",
+    def evaluate_fit(self) -> str:
+        evaluator = make_agent(
+            get_llm(), "Technical Talent Assessor",
+            "Score candidate resume alignment against role criteria objectively.",
+            "You evaluate skills and qualifications, ignoring non-job criteria.",
         )
-        self.state.analysis = ask_agent(
-            agent,
-            "Evaluate this resume against the role description. Score 0–100 using job-related "
-            "skills, relevant experience, and required qualifications. Explain evidence and "
-            "gaps. Do not use age, gender, ethnicity, disability, or other protected traits. "
-            "If role criteria are absent, state assumptions.\nResume and role:\n{material}",
-            "Score, evidence, gaps, and caveats.",
-            {"material": self.state.user_input},
+        task = Task(
+            description=(
+                "Evaluate the candidate resume against role requirements:\n{user_input}\n\n"
+                "Provide an objective score between 0 and 100 with clear rationale."
+            ),
+            expected_output="Structured score and rationale.",
+            agent=evaluator,
+            output_pydantic=ScoreResult,
         )
-        match = re.search(r"(?<!\d)(\d{1,3})\s*/\s*100", self.state.analysis)
-        if not match:
-            match = re.search(r"(?i)score[^0-9]{0,20}(\d{1,3})", self.state.analysis)
-        score = int(match.group(1)) if match else 0
-        self.state.category = "shortlist" if score >= 70 else "review"
+        crew = Crew(agents=[evaluator], tasks=[task], verbose=False)
+        result = crew.kickoff(inputs={"user_input": self.state.user_input})
+        
+        parsed: ScoreResult = result.pydantic if hasattr(result, "pydantic") and result.pydantic else ScoreResult(score=60, rationale=str(result))
+        self.state.analysis = f"Score: {parsed.score}/100\n\n**Rationale**:\n{parsed.rationale}"
+        self.state.category = "shortlist" if parsed.score >= 70 else "reject"
         return self.state.category
 
-    @router(score_resume)
-    def route_resume(self):
+    @router(evaluate_fit)
+    def route_candidate(self):
         return self.state.category
 
     @listen("shortlist")
-    def create_shortlist_recommendation(self) -> str:
-        self.state.output = (
-            "RECOMMENDATION: SHORTLIST (score threshold: 70/100)\n\n"
-            + self.state.analysis
-        )
+    def process_shortlist(self) -> str:
+        self.state.output = f"### STATUS: SHORTLISTED\n\n{self.state.analysis}"
         return self.state.output
 
-    @listen("review")
-    def review_manually(self) -> str:
-        self.state.output = (
-            "RECOMMENDATION: HUMAN REVIEW REQUIRED (score not confidently above 70/100)\n\n"
-            + self.state.analysis
-        )
+    @listen("reject")
+    def process_rejection(self) -> str:
+        self.state.output = f"### STATUS: NOT SHORTLISTED\n\n{self.state.analysis}"
         return self.state.output
 
 
 @app.post("/agent6", response_model=AgentResponse)
-def resume_screening_flow(request: AgentRequest) -> AgentResponse:
+def resume_screening_endpoint(request: AgentRequest) -> AgentResponse:
     try:
         return AgentResponse(output=run_flow(ResumeScreeningFlow, request.input))
-    except HTTPException:
-        raise
     except Exception as exc:
-        print(f"[agent6] {type(exc).__name__}: {exc}")
-        raise HTTPException(status_code=500, detail="Resume Screening Flow failed. Check the server terminal.")
+        raise HTTPException(status_code=500, detail=f"Agent 6 error: {exc}")
 
 
 # ---------------------------------------------------------------------------
-# PROJECT 7 — Bug Triage Flow (bug / feature / question router)
+# Project 7: Bug Triage Flow (Issue Router + Specialized Response)
 # ---------------------------------------------------------------------------
-
 class BugTriageFlow(Flow[WorkflowState]):
     @start()
-    def classify_ticket(self) -> str:
+    def categorize_ticket(self) -> str:
         text = self.state.user_input.lower()
-        if any(word in text for word in ("bug", "crash", "exception", "error", "fails", "broken", "defect")):
+        if any(w in text for w in ("bug", "crash", "error", "defect", "broken", "reproduce")):
             self.state.category = "bug"
-        elif any(word in text for word in ("feature", "add support", "would like", "enhancement", "request")):
+        elif any(w in text for w in ("feature", "enhancement", "support", "add", "request")):
             self.state.category = "feature"
         else:
             self.state.category = "question"
         return self.state.category
 
-    @router(classify_ticket)
-    def route_ticket(self):
+    @router(categorize_ticket)
+    def route_issue(self):
         return self.state.category
 
     @listen("bug")
     def triage_bug(self) -> str:
-        agent = flow_agent("Bug Triage Engineer", "Prioritize bugs and identify diagnostic information.",
-                           "You avoid assuming root cause without logs or reproduction steps.")
-        self.state.output = ask_agent(
-            agent, "Triage this bug report. Provide severity (with rationale), impact, "
-            "reproduction questions, suspected area only if justified, and next steps:\n{ticket}",
-            "Structured bug triage.", {"ticket": self.state.user_input})
-        return self.state.output
+        agent = make_agent(get_llm(), "Defect Triage Engineer", "Isolate software defects and reproduction steps.", "Methodical QA lead.")
+        return ask_agent(agent, "Triage this bug report. Identify severity, likely cause, and reproduction steps:\n{user_input}", "Structured bug triage note.", {"user_input": self.state.user_input})
 
     @listen("feature")
     def triage_feature(self) -> str:
-        agent = flow_agent("Feature Request Analyst", "Clarify feature value and acceptance criteria.",
-                           "You focus on user outcomes, scope, dependencies, and measurable acceptance criteria.")
-        self.state.output = ask_agent(
-            agent, "Analyze this feature request. Provide user value, scope, acceptance criteria, "
-            "dependencies, and questions for the requester:\n{ticket}",
-            "Structured feature assessment.", {"ticket": self.state.user_input})
-        return self.state.output
+        agent = make_agent(get_llm(), "Product Analyst", "Translate feature requests into agile user stories.", "User-centric PM.")
+        return ask_agent(agent, "Draft a user story with acceptance criteria for:\n{user_input}", "Agile user story with acceptance criteria.", {"user_input": self.state.user_input})
 
     @listen("question")
     def triage_question(self) -> str:
-        agent = flow_agent("Issue Support Analyst", "Answer questions or request missing context.",
-                           "You are helpful and do not label a question as a bug without evidence.")
-        self.state.output = ask_agent(
-            agent, "Respond to this product/technical question. Answer if possible; otherwise "
-            "list the missing details needed:\n{ticket}",
-            "A helpful answer or clarification request.", {"ticket": self.state.user_input})
+        agent = make_agent(get_llm(), "Technical Support Specialist", "Answer technical questions helpfully.", "Knowledgeable engineer.")
+        return ask_agent(agent, "Draft an answer or clarification request for:\n{user_input}", "Constructive technical guidance.", {"user_input": self.state.user_input})
+
+    @listen(or_(triage_bug, triage_feature, triage_question))
+    def finalize(self, response: str) -> str:
+        self.state.output = f"**Issue Type**: {self.state.category.upper()}\n\n{response}"
         return self.state.output
 
 
 @app.post("/agent7", response_model=AgentResponse)
-def bug_triage_flow(request: AgentRequest) -> AgentResponse:
+def bug_triage_endpoint(request: AgentRequest) -> AgentResponse:
     try:
         return AgentResponse(output=run_flow(BugTriageFlow, request.input))
-    except HTTPException:
-        raise
     except Exception as exc:
-        print(f"[agent7] {type(exc).__name__}: {exc}")
-        raise HTTPException(status_code=500, detail="Bug Triage Flow failed. Check the server terminal.")
+        raise HTTPException(status_code=500, detail=f"Agent 7 error: {exc}")
 
 
 # ---------------------------------------------------------------------------
-# PROJECT 8 — Content Repurposing Flow (parallel outputs + join)
+# Project 8: Content Repurposing Flow (Parallel Generation Joined with and_)
 # ---------------------------------------------------------------------------
-
 class ContentRepurposingFlow(Flow[WorkflowState]):
     @start()
-    def prepare_source(self) -> str:
-        agent = flow_agent("Content Strategist", "Identify the key message and audience from source content.",
-                           "You preserve the source's meaning and do not introduce unsupported claims.")
+    def extract_core_points(self) -> str:
+        agent = make_agent(get_llm(), "Content Strategist", "Distill key themes and value points from source material.", "Editorial analyst.")
         self.state.analysis = ask_agent(
-            agent, "Extract the main message, audience, 3–6 key points, and tone from this content:\n{source}",
-            "A compact content brief.", {"source": self.state.user_input})
+            agent, "Extract 4-5 core insights and narrative takeaways from this content:\n{user_input}",
+            "Bulleted list of key content insights.", {"user_input": self.state.user_input}
+        )
         return self.state.analysis
 
-    @listen(prepare_source)
-    def create_linkedin(self, brief: str) -> str:
-        agent = flow_agent("LinkedIn Writer", "Create a professional LinkedIn post.",
-                           "You write with a strong opening, useful insight, and restrained hashtags.")
-        return ask_agent(agent, "Turn this brief into a LinkedIn post of 120–220 words. Keep it authentic.\n{brief}",
-                         "One LinkedIn post.", {"brief": brief})
+    @listen(extract_core_points)
+    def generate_linkedin(self, insights: str) -> str:
+        agent = make_agent(get_llm(), "LinkedIn Copywriter", "Craft engaging professional posts.", "Skilled social copywriter.")
+        return ask_agent(agent, "Write a 150-200 word LinkedIn post based on these takeaways:\n{insights}", "Publish-ready LinkedIn post.", {"insights": insights})
 
-    @listen(prepare_source)
-    def create_twitter(self, brief: str) -> str:
-        agent = flow_agent("Short-Form Social Writer", "Create concise posts for X/Twitter.",
-                           "You write concise copy and preserve the central idea.")
-        return ask_agent(agent, "Create 3 alternative X/Twitter posts, each under 280 characters.\n{brief}",
-                         "Three short posts.", {"brief": brief})
+    @listen(extract_core_points)
+    def generate_twitter(self, insights: str) -> str:
+        agent = make_agent(get_llm(), "X/Twitter Thread Specialist", "Craft concise viral threads.", "Punchy thread writer.")
+        return ask_agent(agent, "Draft a 4-tweet thread (numbered 1/4 to 4/4) based on:\n{insights}", "Four-tweet thread sequence.", {"insights": insights})
 
-    @listen(prepare_source)
-    def create_newsletter(self, brief: str) -> str:
-        agent = flow_agent("Newsletter Writer", "Create a short newsletter version of content.",
-                           "You write a useful subject line, preview, and reader-friendly body.")
-        return ask_agent(agent, "Create a newsletter subject, preview text, and 150–250 word body.\n{brief}",
-                         "A newsletter draft.", {"brief": brief})
+    @listen(extract_core_points)
+    def generate_newsletter(self, insights: str) -> str:
+        agent = make_agent(get_llm(), "Newsletter Editor", "Draft readable newsletter segments.", "Engaging newsletter curator.")
+        return ask_agent(agent, "Draft an executive newsletter section with a subject line and 3 takeaways based on:\n{insights}", "Markdown newsletter draft.", {"insights": insights})
 
-    @listen(or_(create_linkedin, create_twitter, create_newsletter))
-    def combine_versions(self, result: str) -> str:
-        # Each branch is a separate Flow event. Return each finished version;
-        # the Flow runtime may invoke this listener for each branch result.
-        current = str(result)
-        if current not in self.state.output:
-            self.state.output += ("\n\n---\n\n" if self.state.output else "") + current
+    @listen(and_(generate_linkedin, generate_twitter, generate_newsletter))
+    def compile_all(self, outputs: list[str]) -> str:
+        linkedin_copy, twitter_copy, newsletter_copy = outputs
+        self.state.output = (
+            f"### 1. LinkedIn Post\n\n{linkedin_copy}\n\n---\n\n"
+            f"### 2. Twitter / X Thread\n\n{twitter_copy}\n\n---\n\n"
+            f"### 3. Newsletter Edition\n\n{newsletter_copy}"
+        )
         return self.state.output
 
 
 @app.post("/agent8", response_model=AgentResponse)
-def content_repurposing_flow(request: AgentRequest) -> AgentResponse:
+def content_repurposing_endpoint(request: AgentRequest) -> AgentResponse:
     try:
-        result = run_flow(ContentRepurposingFlow, request.input)
-        return AgentResponse(output=result)
-    except HTTPException:
-        raise
+        return AgentResponse(output=run_flow(ContentRepurposingFlow, request.input))
     except Exception as exc:
-        print(f"[agent8] {type(exc).__name__}: {exc}")
-        raise HTTPException(status_code=500, detail="Content Repurposing Flow failed. Check the server terminal.")
+        raise HTTPException(status_code=500, detail=f"Agent 8 error: {exc}")
 
 
 # ---------------------------------------------------------------------------
-# PROJECT 9 — Lead Qualification Flow (enrich and hot/warm/cold route)
+# Project 9: Lead Qualification Flow (Structured Scoring & Tier Router)
 # ---------------------------------------------------------------------------
-
 class LeadQualificationFlow(Flow[WorkflowState]):
     @start()
-    def enrich_lead(self) -> str:
-        agent = flow_agent("Lead Research Analyst", "Extract lead needs and qualification signals.",
-                           "You work only from provided details, label assumptions, and do not invent company facts.")
-        self.state.analysis = ask_agent(
-            agent, "Analyze this lead. Extract company, role, need, budget, authority, urgency, "
-            "fit, missing data, and recommended follow-up questions. Then suggest a 0–100 "
-            "qualification score with rationale.\nLead:\n{lead}",
-            "Lead enrichment with an explicit numeric score.", {"lead": self.state.user_input})
-        match = re.search(r"(?i)(?:score|qualification)[^0-9]{0,25}(\d{1,3})", self.state.analysis)
-        score = int(match.group(1)) if match else 50
-        if score >= 75:
+    def qualify_prospect(self) -> str:
+        agent = make_agent(
+            get_llm(), "B2B Sales Qualification Analyst",
+            "Evaluate sales lead profile against enterprise B2B ICP standards.",
+            "Objective sales analyst evaluating authority, budget, and business fit.",
+        )
+        task = Task(
+            description=(
+                "Evaluate this sales lead against a B2B ICP profile (50+ employees or active tech usage):\n"
+                "{user_input}\n\nAssign a qualification score from 0 to 100 with reasoning."
+            ),
+            expected_output="Structured score and evaluation.",
+            agent=agent,
+            output_pydantic=ScoreResult,
+        )
+        crew = Crew(agents=[agent], tasks=[task], verbose=False)
+        result = crew.kickoff(inputs={"user_input": self.state.user_input})
+        
+        parsed: ScoreResult = result.pydantic if hasattr(result, "pydantic") and result.pydantic else ScoreResult(score=50, rationale=str(result))
+        self.state.analysis = f"Qualification Score: {parsed.score}/100\n\n**Rationale**:\n{parsed.rationale}"
+        
+        if parsed.score >= 75:
             self.state.category = "hot"
-        elif score >= 45:
+        elif parsed.score >= 45:
             self.state.category = "warm"
         else:
             self.state.category = "cold"
         return self.state.category
 
-    @router(enrich_lead)
-    def route_lead(self):
+    @router(qualify_prospect)
+    def route_tier(self):
         return self.state.category
 
     @listen("hot")
     def handle_hot(self) -> str:
-        self.state.output = (
-            "LEAD STATUS: HOT — prioritize prompt sales follow-up.\n\n" + self.state.analysis
-        )
+        self.state.output = f"**TIER: HOT (High Priority)**\n\n{self.state.analysis}\n\n*Action*: Schedule direct outbound executive engagement."
         return self.state.output
 
     @listen("warm")
     def handle_warm(self) -> str:
-        self.state.output = (
-            "LEAD STATUS: WARM — nurture and clarify qualification gaps.\n\n" + self.state.analysis
-        )
+        self.state.output = f"**TIER: WARM (Nurture Candidate)**\n\n{self.state.analysis}\n\n*Action*: Enroll in targeted case-study newsletter sequence."
         return self.state.output
 
     @listen("cold")
     def handle_cold(self) -> str:
-        self.state.output = (
-            "LEAD STATUS: COLD — use low-touch nurturing or revisit when signals change.\n\n"
-            + self.state.analysis
-        )
+        self.state.output = f"**TIER: COLD (Low Alignment)**\n\n{self.state.analysis}\n\n*Action*: Archive record in CRM; no immediate outreach needed."
         return self.state.output
 
 
 @app.post("/agent9", response_model=AgentResponse)
-def lead_qualification_flow(request: AgentRequest) -> AgentResponse:
+def lead_qualification_endpoint(request: AgentRequest) -> AgentResponse:
     try:
         return AgentResponse(output=run_flow(LeadQualificationFlow, request.input))
-    except HTTPException:
-        raise
     except Exception as exc:
-        print(f"[agent9] {type(exc).__name__}: {exc}")
-        raise HTTPException(status_code=500, detail="Lead Qualification Flow failed. Check the server terminal.")
+        raise HTTPException(status_code=500, detail=f"Agent 9 error: {exc}")
 
 
 # ---------------------------------------------------------------------------
-# PROJECT 10 — Approval Report Flow (draft -> approval/revision)
+# Project 10: Approval Report Flow (Draft & Decision Router)
 # ---------------------------------------------------------------------------
-
 class ApprovalReportFlow(Flow[WorkflowState]):
     @start()
-    def create_report(self) -> str:
-        agent = flow_agent("Report Analyst", "Prepare a concise report from supplied information.",
-                           "You use the supplied facts, identify assumptions, and state limitations.")
+    def draft_report(self) -> str:
+        agent = make_agent(get_llm(), "Executive Research Analyst", "Compile structured operational reports.", "Authoritative reporter.")
         self.state.analysis = ask_agent(
-            agent, "Create a report with Executive Summary, Findings, Recommendations, Risks, "
-            "and Open Questions from the following material:\n{material}",
-            "A draft report in Markdown.", {"material": self.state.user_input})
+            agent, "Draft a report with Executive Summary, Findings, and Risks based on:\n{user_input}",
+            "Draft report in Markdown.", {"user_input": self.state.user_input}
+        )
         return self.state.analysis
 
-    @router(create_report)
-    def check_approval_instruction(self):
-        # The endpoint remains one-request/one-response. Include a line such as
-        # 'Approval: approve' or 'Approval: revise' in the input to simulate feedback.
+    @router(draft_report)
+    def evaluate_decision(self):
         text = self.state.user_input.lower()
         if re.search(r"approval\s*:\s*approve\b|\bapproved\b", text):
             self.state.approval = "approved"
@@ -811,42 +655,38 @@ class ApprovalReportFlow(Flow[WorkflowState]):
         return "pending"
 
     @listen("approved")
-    def approve_report(self) -> str:
-        self.state.output = "STATUS: APPROVED\n\n" + self.state.analysis
+    def publish_approved(self) -> str:
+        self.state.output = f"### STATUS: APPROVED & PUBLISHED\n\n{self.state.analysis}"
         return self.state.output
 
     @listen("revise")
-    def revise_report(self) -> str:
-        agent = flow_agent("Report Editor", "Revise a report using requested feedback.",
-                           "You preserve accurate facts and clearly improve the draft based on feedback.")
+    def apply_revision(self) -> str:
+        editor = make_agent(get_llm(), "Report Editor", "Incorporate review feedback cleanly.", "Meticulous editor.")
         revised = ask_agent(
-            agent, "Revise this report. The original user input includes the material and any "
-            "revision notes. Incorporate those notes, and if they are vague, improve clarity "
-            "and structure without inventing facts.\nDraft:\n{draft}\n\nOriginal input:\n{material}",
-            "A revised report in Markdown.",
-            {"draft": self.state.analysis, "material": self.state.user_input},
+            editor, "Revise this report draft incorporating the user feedback:\n\nDraft:\n{draft}\n\nFeedback:\n{user_input}",
+            "Revised Markdown report.", {"draft": self.state.analysis, "user_input": self.state.user_input}
         )
-        self.state.output = "STATUS: REVISED — human approval is still recommended\n\n" + revised
+        self.state.output = f"### STATUS: REVISED DRAFT\n\n{revised}"
         return self.state.output
 
     @listen("pending")
-    def request_approval(self) -> str:
+    def request_review(self) -> str:
         self.state.output = (
-            "STATUS: PENDING HUMAN APPROVAL\n\n"
-            "Review the draft below. To simulate the approval decision in this single-request "
-            "API, include 'Approval: approve' or 'Approval: revise' in the input and submit again.\n\n"
-            + self.state.analysis
+            f"### STATUS: AWAITING APPROVAL\n\n{self.state.analysis}\n\n---\n"
+            f"*Next Steps*: To simulate an approval cycle, submit again including either `'Approval: approve'` or `'Approval: revise: <feedback>'`."
         )
         return self.state.output
 
 
 @app.post("/agent10", response_model=AgentResponse)
-def approval_report_flow(request: AgentRequest) -> AgentResponse:
+def approval_report_endpoint(request: AgentRequest) -> AgentResponse:
     try:
         result = run_flow(ApprovalReportFlow, request.input)
-        return AgentResponse(output=save_markdown("approval_report.md", "Approval Report", result))
-    except HTTPException:
-        raise
+        return AgentResponse(output=save_artifact("approval_report.md", "Approval Report", result))
     except Exception as exc:
-        print(f"[agent10] {type(exc).__name__}: {exc}")
-        raise HTTPException(status_code=500, detail="Approval Report Flow failed. Check the server terminal.")
+        raise HTTPException(status_code=500, detail=f"Agent 10 error: {exc}")
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
